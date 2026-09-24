@@ -32,6 +32,15 @@ def build_handler(app):
             self.end_headers()
             self.wfile.write(body)
 
+        def _send_app_error(self, error):
+            # 409 callback_conflict / 404 找不到事件 / 400 字段错误可机器区分
+            body = {"error": str(error)}
+            if getattr(error, "code", None):
+                body["code"] = error.code
+            for key, value in (getattr(error, "details", None) or {}).items():
+                body.setdefault(key, value)
+            self._send_json(error.status, body)
+
         def _read_body(self):
             length = int(self.headers.get("Content-Length") or 0)
             if not length:
@@ -73,7 +82,7 @@ def build_handler(app):
                 else:
                     self._send_json(404, {"error": "路由不存在", "path": parsed.path})
             except AppError as error:
-                self._send_json(error.status, {"error": str(error)})
+                self._send_app_error(error)
 
         def do_POST(self):
             parsed = urlparse(self.path)
@@ -164,7 +173,7 @@ def build_handler(app):
                 else:
                     self._send_json(404, {"error": "路由不存在", "path": path})
             except AppError as error:
-                self._send_json(error.status, {"error": str(error)})
+                self._send_app_error(error)
 
         def log_message(self, *_args):
             return

@@ -5,11 +5,15 @@
 - 普通批评只登记线索、不立事件；直接人身威胁自动按值班规则升级且只通知一次；
 - 聚类只产生合并建议，须保护专员人工确认；
 - 报案/平台投诉/公开澄清按职责分离提交、分角色复核，禁止自复核；
-- 平台回调按 callback_id 幂等，重复回调不通知、不产生第二案件；
+- 平台回调按 callback_id 幂等：仅当规范化后的事件归属、回执、账号与内容状态
+  与首次处理完全一致时才返回首次结果；同编号异内容回调按冲突拒绝（409），
+  不改动任何事件、不发送通知、不产生部分账本记录；请求指纹随账本持久化；
 - 申诉期间限制敏感材料扩散并阻断对外动作；授权撤回不抹除责任链。
 """
 
 import hashlib
+import json
+import threading
 from datetime import datetime, timezone, timedelta
 
 from domain import load_config
@@ -42,9 +46,11 @@ def suggest_severity(text):
 
 
 class AppError(ValueError):
-    def __init__(self, message, status=400):
+    def __init__(self, message, status=400, code=None, details=None):
         super().__init__(message)
         self.status = status
+        self.code = code
+        self.details = details or {}
 
 
 def _require(actor, allowed_roles):
@@ -64,9 +70,10 @@ class SafeguardingApp:
         self.incidents = {}          # incident_id -> 事件投影
         self.actions = {}            # action_id -> 动作记录
         self.suggestions = {}        # suggestion_id -> 合并建议
-        self.callbacks = {}          # callback_id -> 首次处理结果
+        self.callbacks = {}          # callback_id -> 首次处理记录（结果/指纹/首次接收内容/被拒冲突）
         self.notifications = []      # 通知外发箱（抽象渠道）
         self._suggestion_keys = set()
+        self._callback_lock = threading.RLock()  # 回调“查重-处理-落账”整体串行化
         self._replay()
         self.store.subscribe(self._apply)
 
@@ -238,6 +245,7 @@ class SafeguardingApp:
             "actions": [],
             "escalation": None,
             "appeal": None,
+            "callbacks": [],
             "merged_into": None,
             "absorbed": [],
             "false_report_upheld": False,
@@ -424,8 +432,33 @@ class SafeguardingApp:
         self.notifications.append(p)
 
     def _on_callback_processed(self, p):
-        if p["callback_id"] not in self.callbacks:
-            self.callbacks[p["callback_id"]] = p["result"]
+        if p["callback_id"] in self.callbacks:
+            return
+        record = {
+            "callback_id": p["callback_id"],
+            # 旧账本记录没有 fingerprint/normalized 字段，重放后为 None，走兼容策略
+            "fingerprint": p.get("fingerprint"),
+            "first_content": p.get("normalized"),
+            "result": p["result"],
+            "at": p.get("at"),
+            "conflicts": [],
+        }
+        self.callbacks[p["callback_id"]] = record
+        inc = self.incidents.get(p["result"].get("incident_id"))
+        if inc is not None:
+            inc["callbacks"].append(record)
+
+    def _on_callback_conflict(self, p):
+        # 冲突审计：只登记“被拒绝的异内容重放”，不改动任何事件状态
+        record = self.callbacks.get(p["callback_id"])
+        if record is not None:
+            record["conflicts"].append({
+                "received": p.get("received"),
+                "attempted_incident_id": p.get("attempted_incident_id"),
+                "differences": p.get("differences", []),
+                "rejected": True,
+                "at": p.get("at"),
+            })
 
     # ------------------------------------------------------------- 严重度确认
     def confirm_severity(self, incident_id, severity, actor):
@@ -736,18 +769,122 @@ class SafeguardingApp:
         })
 
     # ------------------------------------------------------------------ 回调
-    def platform_callback(self, payload):
-        """平台/采集回调。以 callback_id 幂等：重复回调不通知、不产生第二案件。"""
-        callback_id = payload.get("callback_id")
-        if not callback_id:
-            raise AppError("回调必须携带 callback_id")
-        if callback_id in self.callbacks:
-            first = self.callbacks[callback_id]
-            return {"duplicate": True, "callback_id": callback_id, **first}
+    # 回调指纹的四个规范化维度：事件归属、回执、账号、内容状态
+    _CALLBACK_ASPECTS = (
+        ("incident_id", "事件归属"),
+        ("receipt", "回执"),
+        ("account", "账号"),
+        ("content_url", "内容状态"),
+    )
+    _RECEIPT_FIELDS = ("receipt_id", "platform", "status", "reported_at", "content_url")
+    _ACCOUNT_FIELDS = ("platform", "account_key", "display_name", "url")
 
+    def platform_callback(self, payload):
+        """平台/采集回调。以 callback_id 幂等：
+
+        - 首次到达：处理并把规范化指纹与处理结果一起落账；
+        - 完全重放（指纹一致）：返回首次结果，不通知、不产生第二案件；
+        - 异内容重放（指纹不一致）：追加 callback_conflict 审计事件后按冲突拒绝，
+          不改动任何事件、不发送通知、不产生部分账本记录。
+        """
+        if not isinstance(payload, dict):
+            raise AppError("回调请求体必须是 JSON 对象")
+        with self._callback_lock:
+            callback_id = payload.get("callback_id")
+            if not callback_id:
+                raise AppError("回调必须携带 callback_id")
+            for field in ("receipt", "account"):
+                if payload.get(field) is not None and not isinstance(payload[field], dict):
+                    raise AppError(f"回调字段 {field} 必须是对象")
+            record = self.callbacks.get(callback_id)
+            if record is not None:
+                return self._replay_or_conflict(record, payload)
+            incident = self._resolve_callback_incident(payload)
+            if incident is None:
+                raise AppError("回调未匹配到既有事件，须先经当事人或授权代理报送立案", 404)
+            return self._process_callback(payload, incident)
+
+    def _replay_or_conflict(self, record, payload):
+        """同编号回调的二次到达：指纹一致才是重放，否则确定性地报冲突。"""
+        callback_id = record["callback_id"]
         incident = self._resolve_callback_incident(payload)
-        if incident is None:
-            raise AppError("回调未匹配到既有事件，须先经当事人或授权代理报送立案", 404)
+        resolved_id = incident["incident_id"] if incident else None
+        normalized = self._normalize_callback(payload, resolved_id)
+        if record["fingerprint"] is None:
+            # 兼容策略：旧账本记录没有指纹，只能按事件归属核验——
+            # 归属一致按重放处理；归属不同或无法归属一律按冲突拒绝。
+            if resolved_id and resolved_id == record["result"].get("incident_id"):
+                return {"duplicate": True, "callback_id": callback_id, **record["result"]}
+            differences = ["事件归属（旧账本记录无指纹，仅归属可核验）"]
+            self._record_callback_conflict(record, normalized, resolved_id, differences)
+            raise self._callback_conflict_error(record, normalized, differences)
+        if self._callback_fingerprint(normalized) == record["fingerprint"]:
+            return {"duplicate": True, "callback_id": callback_id, **record["result"]}
+        differences = [label for key, label in self._CALLBACK_ASPECTS
+                       if (record["first_content"] or {}).get(key) != normalized.get(key)]
+        self._record_callback_conflict(record, normalized, resolved_id, differences)
+        raise self._callback_conflict_error(record, normalized, differences)
+
+    def _callback_conflict_error(self, record, normalized, differences):
+        return AppError(
+            f"回调 {record['callback_id']} 的载荷与首次处理不一致"
+            f"（{'、'.join(differences)}），已拒绝：未改动任何事件、未发送通知",
+            status=409, code="callback_conflict",
+            details={"callback_id": record["callback_id"],
+                     "differences": differences,
+                     "first_content": record["first_content"],
+                     "received_content": normalized})
+
+    def _record_callback_conflict(self, record, normalized, resolved_id, differences):
+        # 同一异内容反复到达只记一条冲突事实（账本层按 event_id 幂等）
+        event_id = "cbc:{}:{}".format(
+            record["callback_id"], self._callback_fingerprint(normalized))
+        self._append("callback_conflict", {
+            "callback_id": record["callback_id"],
+            "incident_id": record["result"].get("incident_id"),
+            "attempted_incident_id": resolved_id,
+            "received": normalized,
+            "differences": differences,
+            "rejected": True,
+            "at": now_iso(),
+        }, event_id=event_id)
+
+    def _normalize_callback(self, payload, incident_id):
+        """把回调载荷规范化为四个可比维度，消除字段顺序与默认值写法差异。"""
+        platform = payload.get("platform")
+        receipt = payload.get("receipt") or {}
+        norm_receipt = {}
+        for field in self._RECEIPT_FIELDS:
+            value = receipt.get(field)
+            if field == "platform" and not value:
+                value = platform
+            if value not in (None, ""):
+                norm_receipt[field] = value
+        account = payload.get("account") or {}
+        norm_account = {}
+        for field in self._ACCOUNT_FIELDS:
+            value = account.get(field)
+            if field == "platform" and not value:
+                value = platform
+            if value not in (None, ""):
+                norm_account[field] = value
+        content_url = payload.get("content_url") or receipt.get("content_url")
+        normalized = {"incident_id": incident_id}
+        if norm_receipt:
+            normalized["receipt"] = norm_receipt
+        if norm_account:
+            normalized["account"] = norm_account
+        if content_url:
+            normalized["content_url"] = content_url
+        return normalized
+
+    def _callback_fingerprint(self, normalized):
+        blob = json.dumps(normalized, sort_keys=True, ensure_ascii=False,
+                          separators=(",", ":"))
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+    def _process_callback(self, payload, incident):
+        callback_id = payload["callback_id"]
         incident_id = incident["incident_id"]
         at = now_iso()
         attached = []
@@ -799,13 +936,19 @@ class SafeguardingApp:
                 attached.append("account_linked")
 
         # 回调附件不产生任何通知，也绝不另立案件
-        result = {"duplicate": False, "callback_id": callback_id,
-                  "incident_id": incident_id, "attached": attached}
-        stored = {k: v for k, v in result.items() if k != "duplicate"}
-        self.callbacks[callback_id] = stored
-        # 事件化记录，保证账本重放（含重启）后幂等索引仍然有效
-        self._append("callback_processed", {"callback_id": callback_id, "result": stored, "at": at})
-        return result
+        stored = {"callback_id": callback_id, "incident_id": incident_id,
+                  "attached": attached}
+        normalized = self._normalize_callback(payload, incident_id)
+        # 指纹与首次处理事实随账本持久化：重启后仍能识别完全重放与异内容重放
+        self._append("callback_processed", {
+            "callback_id": callback_id,
+            "incident_id": incident_id,
+            "fingerprint": self._callback_fingerprint(normalized),
+            "normalized": normalized,
+            "result": stored,
+            "at": at,
+        }, event_id=f"cbp:{callback_id}")
+        return {"duplicate": False, **stored}
 
     def _resolve_callback_incident(self, payload):
         explicit = payload.get("incident_id")
@@ -914,12 +1057,34 @@ class SafeguardingApp:
             },
             "值班升级": inc["escalation"],
             "申诉": inc["appeal"],
+            "平台回调": [self._callback_view(r, mask) for r in inc["callbacks"]],
             "责任链": self._timeline(inc, mask),
         }
         if inc.get("closed_at"):
             digest["closed_at"] = inc["closed_at"]
             digest["close_reason"] = inc["close_reason"]
         return digest
+
+    def _callback_view(self, record, mask):
+        """摘要中的回调条目：首次接收内容、指纹、以及被拒绝的异内容重放。"""
+        view = {
+            "callback_id": record["callback_id"],
+            "processed_at": record["at"],
+            "attached": record["result"].get("attached", []),
+            "fingerprint": record["fingerprint"],
+            "first_content": record["first_content"],
+            "conflicts": record["conflicts"],
+        }
+        if record["fingerprint"] is None:
+            view["legacy"] = True
+            view["note"] = "旧账本记录未留存请求指纹，重放按事件归属核验"
+        if mask:
+            if view["first_content"] is not None:
+                view["first_content"] = "【申诉期间已限制】"
+            view["conflicts"] = [
+                {**c, "received": "【申诉期间已限制】"} for c in record["conflicts"]
+            ]
+        return view
 
     def _action_view(self, action_id, inc):
         a = self.actions[action_id]
@@ -956,7 +1121,8 @@ class SafeguardingApp:
         if mask:
             for item in chain:
                 p = item["payload"]
-                for field in ("content_ref", "content_url", "raw_excerpt", "url", "display_name"):
+                for field in ("content_ref", "content_url", "raw_excerpt", "url",
+                              "display_name", "received", "normalized"):
                     if field in p and p[field]:
                         p[field] = "【申诉期间已限制】"
                 if "linked_accounts" in p:

@@ -10,7 +10,7 @@
 - **自动聚类只建议**：同当事人+同内容哈希、或共享关联账号时生成合并建议，须保护专员人工确认才合并。
 - **职责分离**：平台投诉→平台联络员复核；报案、公开澄清→法务复核员复核；提交人不得复核自己发起的动作。
 - **授权驱动**：当事人当前授权不足时，已批准的对外动作保持 blocked；撤回授权不抹除已完成动作与既有责任链；申诉/司法程序存续期间证据留存授权不可撤回。
-- **回调幂等**：平台回调按 `callback_id` 去重，重复回调返回 `duplicate=true`，不通知、不产生第二案件、不重复挂回执；回调无法凭匿名内容另立案件。
+- **回调幂等**：平台回调按 `callback_id` 去重。相同编号只有在规范化后的**事件归属、回执、账号、内容状态**与首次处理完全一致时才返回首次结果（`duplicate=true`）；载荷发生变化的同编号回调按冲突拒绝（HTTP 409，`code=callback_conflict`），不改动任何事件、不发送通知、不产生部分账本记录。首次处理的请求指纹（SHA-256）与处理结果随追加式账本持久化，进程重启后仍能识别完全重放与异内容重放；旧账本中无指纹的记录按事件归属确定性核验（归属一致视为重放，归属不同或无法归属一律按冲突拒绝）。回调无法凭匿名内容另立案件。
 - **误报申诉**：申诉期间事件置"申诉中"，敏感材料仅法务复核员与值班主管可见，并阻断新的对外动作。
 - **直接威胁去重**：同一事件值班周期内重复确认威胁等级只刷新确认时间，不产生第二案件或第二次通知。
 
@@ -20,7 +20,7 @@
 python3 service.py --check          # 检查配置与可重放账本
 python3 service.py --port 8000      # 内存账本（联调）
 python3 service.py --data data/events.jsonl   # 追加式持久化账本（重启可重放）
-npm test                            # 全部契约测试（27 项）
+npm test                            # 全部契约测试（32 项）
 ```
 
 ## HTTP 接口
@@ -33,7 +33,7 @@ npm test                            # 全部契约测试（27 项）
 | POST | `/reports` | 报送线索；按严重度决定不立案或开新事件并返回 `incident_id` |
 | POST | `/severity/suggest` | 联调辅助：按文本给严重度建议（不替代人工判定） |
 | GET | `/reports` `/incidents` `/suggestions` `/notifications` | 列表（支持 status/severity/as_role 过滤） |
-| GET | `/incidents/{id}/digest?as_role=…` | **保护专员统一视图**：证据依据、处置决定、当事人当前授权范围、尚未完成的保护动作、值班升级、责任链 |
+| GET | `/incidents/{id}/digest?as_role=…` | **保护专员统一视图**：证据依据、处置决定、当事人当前授权范围、尚未完成的保护动作、值班升级、平台回调（首次接收内容与被拒冲突）、责任链 |
 | POST | `/incidents/{id}/severity` | 保护专员确认/调整严重度 |
 | POST | `/incidents/{id}/escalation/ack` | 值班主管响应升级 |
 | POST | `/incidents/{id}/evidence` | 补充受控证据（只收 `content_ref` + 可选哈希） |
@@ -43,7 +43,7 @@ npm test                            # 全部契约测试（27 项）
 | POST | `/incidents/{id}/consent/grant` `/consent/revoke` | 当事人代理授予/撤回授权 |
 | POST | `/incidents/{id}/appeal` `/appeal/resolve` | 发起误报申诉、法务裁定（upheld/dismissed） |
 | POST | `/suggestions/{id}` | 保护专员 accept/reject 合并建议（accept 时给 `target_incident`） |
-| POST | `/callbacks/platform` | 平台/采集回调（幂等键 `callback_id`；可携带回执、删除状态、改名信息） |
+| POST | `/callbacks/platform` | 平台/采集回调（幂等键 `callback_id`；可携带回执、删除状态、改名信息。同编号异内容返回 409 `callback_conflict`；找不到事件 404；字段错误 400） |
 | POST | `/incidents/{id}/close` | 关闭事件（存在未响应升级或未完成动作时拒绝） |
 
 ## 代码结构
